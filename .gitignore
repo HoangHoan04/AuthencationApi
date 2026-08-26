@@ -1,0 +1,22 @@
+## Visual Studio & VS Code cache
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Build results
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+## Environment variables & secrets
+.env
+appsettings.Development.json
+*.local.json
+
+## OS generated files
+.DS_Store
+Thumbs.db
