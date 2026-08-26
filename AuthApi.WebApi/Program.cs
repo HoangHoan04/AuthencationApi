@@ -69,16 +69,6 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
-// 5. Database auto-migration & seed on startup
-try
-{
-    await DatabaseBootstrap.InitializeDatabaseAsync(app.Services);
-}
-catch (Exception ex)
-{
-    app.Logger.LogError(ex, "Failed to initialize database during startup.");
-}
-
 // 6. Configure Middleware Pipeline
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 
