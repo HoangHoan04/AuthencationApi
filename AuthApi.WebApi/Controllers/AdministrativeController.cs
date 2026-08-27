@@ -8,6 +8,10 @@ namespace AuthApi.WebApi.Controllers;
 
 public class ExportProvincesQuery
 {
+    public string? Code { get; set; }
+    public string? Name { get; set; }
+    public string? DivisionTypeName { get; set; }
+    public string? AdministrativeRegion { get; set; }
     public string? Search { get; set; }
     public bool? IsActive { get; set; }
 }
@@ -15,6 +19,9 @@ public class ExportProvincesQuery
 public class ExportWardsQuery
 {
     public string? ProvinceCode { get; set; }
+    public string? Code { get; set; }
+    public string? Name { get; set; }
+    public string? DivisionTypeName { get; set; }
     public string? Search { get; set; }
     public bool? IsActive { get; set; }
 }
@@ -34,9 +41,15 @@ public class AdministrativeController : ControllerBase
 
     [AllowAnonymous]
     [HttpGet("provinces")]
-    public async Task<ActionResult<List<ProvinceDto>>> GetProvinces([FromQuery] string? search, [FromQuery] bool? isActive)
+    public async Task<ActionResult<List<ProvinceDto>>> GetProvinces(
+        [FromQuery] string? code,
+        [FromQuery] string? name,
+        [FromQuery] string? divisionTypeName,
+        [FromQuery] string? administrativeRegion,
+        [FromQuery] string? search,
+        [FromQuery] bool? isActive)
     {
-        var provinces = await _adminService.GetProvincesAsync(search, isActive);
+        var provinces = await _adminService.GetProvincesAsync(code, name, divisionTypeName, administrativeRegion, search, isActive);
         return Ok(provinces);
     }
 
@@ -51,17 +64,29 @@ public class AdministrativeController : ControllerBase
 
     [AllowAnonymous]
     [HttpGet("provinces/{provinceCode}/wards")]
-    public async Task<ActionResult<List<WardDto>>> GetWardsByProvince(string provinceCode, [FromQuery] string? search, [FromQuery] bool? isActive)
+    public async Task<ActionResult<List<WardDto>>> GetWardsByProvince(
+        string provinceCode,
+        [FromQuery] string? code,
+        [FromQuery] string? name,
+        [FromQuery] string? divisionTypeName,
+        [FromQuery] string? search,
+        [FromQuery] bool? isActive)
     {
-        var wards = await _adminService.GetWardsAsync(provinceCode, search, isActive);
+        var wards = await _adminService.GetWardsAsync(provinceCode, code, name, divisionTypeName, search, isActive);
         return Ok(wards);
     }
 
     [AllowAnonymous]
     [HttpGet("wards")]
-    public async Task<ActionResult<List<WardDto>>> GetAllWards([FromQuery] string? provinceCode, [FromQuery] string? search, [FromQuery] bool? isActive)
+    public async Task<ActionResult<List<WardDto>>> GetAllWards(
+        [FromQuery] string? provinceCode,
+        [FromQuery] string? code,
+        [FromQuery] string? name,
+        [FromQuery] string? divisionTypeName,
+        [FromQuery] string? search,
+        [FromQuery] bool? isActive)
     {
-        var wards = await _adminService.GetWardsAsync(provinceCode, search, isActive);
+        var wards = await _adminService.GetWardsAsync(provinceCode, code, name, divisionTypeName, search, isActive);
         return Ok(wards);
     }
 
@@ -146,7 +171,13 @@ public class AdministrativeController : ControllerBase
     [HttpPost("provinces/excel/export")]
     public async Task<IActionResult> ExportProvincesExcel([FromBody] ExportProvincesQuery query)
     {
-        var content = await _adminService.ExportProvincesExcelAsync(query.Search, query.IsActive);
+        var content = await _adminService.ExportProvincesExcelAsync(
+            query.Code,
+            query.Name,
+            query.DivisionTypeName,
+            query.AdministrativeRegion,
+            query.Search,
+            query.IsActive);
         var fileName = $"Danh_Sach_Tinh_Thanh_{DateTime.Now:yyyyMMdd_HHmmss}.xlsx";
         return File(content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fileName);
     }
@@ -179,7 +210,13 @@ public class AdministrativeController : ControllerBase
     [HttpPost("wards/excel/export")]
     public async Task<IActionResult> ExportWardsExcel([FromBody] ExportWardsQuery query)
     {
-        var content = await _adminService.ExportWardsExcelAsync(query.ProvinceCode, query.Search, query.IsActive);
+        var content = await _adminService.ExportWardsExcelAsync(
+            query.ProvinceCode,
+            query.Code,
+            query.Name,
+            query.DivisionTypeName,
+            query.Search,
+            query.IsActive);
         var fileName = $"Danh_Sach_Phuong_Xa_{DateTime.Now:yyyyMMdd_HHmmss}.xlsx";
         return File(content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fileName);
     }
@@ -206,3 +243,4 @@ public class AdministrativeController : ControllerBase
         return Ok(result);
     }
 }
+

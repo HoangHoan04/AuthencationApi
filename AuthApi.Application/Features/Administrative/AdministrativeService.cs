@@ -12,22 +12,22 @@ namespace AuthApi.Application.Features.Administrative;
 
 public interface IAdministrativeService
 {
-    Task<List<ProvinceDto>> GetProvincesAsync(string? search, bool? isActive = null);
+    Task<List<ProvinceDto>> GetProvincesAsync(string? code = null, string? name = null, string? divisionTypeName = null, string? administrativeRegion = null, string? search = null, bool? isActive = null);
     Task<ProvinceDto?> GetProvinceByCodeAsync(string code);
     Task<ProvinceDto> CreateProvinceAsync(CreateProvinceRequest request);
     Task<ProvinceDto> UpdateProvinceAsync(Guid id, UpdateProvinceRequest request);
     Task<bool> DeleteProvinceAsync(Guid id);
-    Task<List<WardDto>> GetWardsAsync(string? provinceCode, string? search, bool? isActive = null);
+    Task<List<WardDto>> GetWardsAsync(string? provinceCode = null, string? code = null, string? name = null, string? divisionTypeName = null, string? search = null, bool? isActive = null);
     Task<WardDto?> GetWardByCodeAsync(string code);
     Task<WardDto> CreateWardAsync(CreateWardRequest request);
     Task<WardDto> UpdateWardAsync(Guid id, UpdateWardRequest request);
     Task<bool> DeleteWardAsync(Guid id);
     Task<List<AdministrativeTreeNodeDto>> GetAdministrativeTreeAsync();
     Task<List<object>> SearchAdministrativeUnitsAsync(string query, int limit = 20);
-    Task<byte[]> ExportProvincesExcelAsync(string? search, bool? isActive = null);
+    Task<byte[]> ExportProvincesExcelAsync(string? code = null, string? name = null, string? divisionTypeName = null, string? administrativeRegion = null, string? search = null, bool? isActive = null);
     Task<byte[]> DownloadProvinceExcelTemplateAsync();
     Task<ImportResultDto> ImportProvincesExcelAsync(Stream fileStream);
-    Task<byte[]> ExportWardsExcelAsync(string? provinceCode, string? search, bool? isActive = null);
+    Task<byte[]> ExportWardsExcelAsync(string? provinceCode = null, string? code = null, string? name = null, string? divisionTypeName = null, string? search = null, bool? isActive = null);
     Task<byte[]> DownloadWardExcelTemplateAsync();
     Task<ImportResultDto> ImportWardsExcelAsync(Stream fileStream);
 }
@@ -41,7 +41,13 @@ public class AdministrativeService : IAdministrativeService
         _context = context;
     }
 
-    public async Task<List<ProvinceDto>> GetProvincesAsync(string? search, bool? isActive = null)
+    public async Task<List<ProvinceDto>> GetProvincesAsync(
+        string? code = null,
+        string? name = null,
+        string? divisionTypeName = null,
+        string? administrativeRegion = null,
+        string? search = null,
+        bool? isActive = null)
     {
         var query = _context.Provinces
             .Include(p => p.Wards)
@@ -50,6 +56,32 @@ public class AdministrativeService : IAdministrativeService
         if (isActive.HasValue)
         {
             query = query.Where(p => p.IsActive == isActive.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(code))
+        {
+            var c = code.Trim().ToLower();
+            query = query.Where(p => p.Code.ToLower().Contains(c));
+        }
+
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            var n = name.Trim().ToLower();
+            query = query.Where(p => p.Name.ToLower().Contains(n) || p.FullName.ToLower().Contains(n));
+        }
+
+        if (!string.IsNullOrWhiteSpace(divisionTypeName))
+        {
+            var dt = AdministrativeEnumExtensions.ParseProvinceDivisionType(divisionTypeName);
+            query = query.Where(p => p.DivisionType == dt);
+        }
+
+        if (!string.IsNullOrWhiteSpace(administrativeRegion))
+        {
+            var reg = AdministrativeEnumExtensions.ParseAdministrativeRegion(administrativeRegion);
+            var regDisplay = reg?.ToDisplayName() ?? administrativeRegion.Trim();
+            var regCode = reg?.ToCode() ?? administrativeRegion.Trim();
+            query = query.Where(p => p.AdministrativeRegion == regDisplay || p.AdministrativeRegion == regCode || p.AdministrativeRegion == administrativeRegion);
         }
 
         if (!string.IsNullOrWhiteSpace(search))
@@ -145,7 +177,13 @@ public class AdministrativeService : IAdministrativeService
         return true;
     }
 
-    public async Task<List<WardDto>> GetWardsAsync(string? provinceCode, string? search, bool? isActive = null)
+    public async Task<List<WardDto>> GetWardsAsync(
+        string? provinceCode = null,
+        string? code = null,
+        string? name = null,
+        string? divisionTypeName = null,
+        string? search = null,
+        bool? isActive = null)
     {
         var query = _context.Wards
             .Include(w => w.Province)
@@ -160,6 +198,24 @@ public class AdministrativeService : IAdministrativeService
         if (isActive.HasValue)
         {
             query = query.Where(w => w.IsActive == isActive.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(code))
+        {
+            var c = code.Trim().ToLower();
+            query = query.Where(w => w.Code.ToLower().Contains(c));
+        }
+
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            var n = name.Trim().ToLower();
+            query = query.Where(w => w.Name.ToLower().Contains(n) || w.FullName.ToLower().Contains(n));
+        }
+
+        if (!string.IsNullOrWhiteSpace(divisionTypeName))
+        {
+            var dt = AdministrativeEnumExtensions.ParseWardDivisionType(divisionTypeName);
+            query = query.Where(w => w.DivisionType == dt);
         }
 
         if (!string.IsNullOrWhiteSpace(search))
@@ -338,9 +394,15 @@ public class AdministrativeService : IAdministrativeService
         return result.Take(limit).ToList();
     }
 
-    public async Task<byte[]> ExportProvincesExcelAsync(string? search, bool? isActive = null)
+    public async Task<byte[]> ExportProvincesExcelAsync(
+        string? code = null,
+        string? name = null,
+        string? divisionTypeName = null,
+        string? administrativeRegion = null,
+        string? search = null,
+        bool? isActive = null)
     {
-        var provinces = await GetProvincesAsync(search, isActive);
+        var provinces = await GetProvincesAsync(code, name, divisionTypeName, administrativeRegion, search, isActive);
 
         using var workbook = new XLWorkbook();
         var ws = workbook.Worksheets.Add("DanhSachTinhThanh");
@@ -524,9 +586,15 @@ public class AdministrativeService : IAdministrativeService
         return result;
     }
 
-    public async Task<byte[]> ExportWardsExcelAsync(string? provinceCode, string? search, bool? isActive = null)
+    public async Task<byte[]> ExportWardsExcelAsync(
+        string? provinceCode = null,
+        string? code = null,
+        string? name = null,
+        string? divisionTypeName = null,
+        string? search = null,
+        bool? isActive = null)
     {
-        var wards = await GetWardsAsync(provinceCode, search, isActive);
+        var wards = await GetWardsAsync(provinceCode, code, name, divisionTypeName, search, isActive);
 
         using var workbook = new XLWorkbook();
         var ws = workbook.Worksheets.Add("DanhSachPhuongXa");

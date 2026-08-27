@@ -54,7 +54,7 @@ builder.Services.AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationSc
 
 // 4. Configure CORS
 var allowedOrigins = builder.Configuration.GetSection("CorsSettings:AllowedOrigins").Get<string[]>()
-    ?? new[] { "http://localhost:4200", "http://localhost:4300" };
+    ?? new[] { "http://localhost:4200", "http://localhost:4201", "http://localhost:4202", "http://localhost:4203", "http://localhost:4300", "http://localhost:4400", "http://localhost:4500", "http://localhost:8000" };
 
 builder.Services.AddCors(options =>
 {
