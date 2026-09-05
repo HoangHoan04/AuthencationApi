@@ -10,6 +10,7 @@ public interface ISecurityService
     Task<List<SessionDto>> GetSessionsAsync(Guid? userId, bool includeRevoked = false);
     Task<bool> RevokeSessionAsync(Guid sessionId, Guid? requestingUserId);
     Task<List<LoginHistoryDto>> GetLoginHistoriesAsync(int limit = 100);
+    Task<List<SecurityKeyDto>> GetSigningKeysAsync();
 }
 
 public class SecurityService : ISecurityService
@@ -61,5 +62,23 @@ public class SecurityService : ISecurityService
             .ToListAsync();
 
         return logs.Select(SecurityMapper.ToDto).ToList();
+    }
+
+    public async Task<List<SecurityKeyDto>> GetSigningKeysAsync()
+    {
+        var keys = await _context.SigningKeys
+            .OrderByDescending(k => k.CreatedAt)
+            .ToListAsync();
+
+        return keys.Select(k => new SecurityKeyDto
+        {
+            KeyId = k.KeyId,
+            Algorithm = k.Algorithm,
+            Use = k.Use,
+            CreatedAt = k.CreatedAt,
+            IsActive = k.Status == Domain.Enums.SigningKeyStatus.Active,
+            Status = k.Status.ToString(),
+            RotatedAt = k.RotatedAt
+        }).ToList();
     }
 }

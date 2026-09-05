@@ -40,4 +40,6 @@ public class SecurityKeyDto
     public string Exponent { get; set; } = string.Empty;
     public DateTimeOffset CreatedAt { get; set; }
     public bool IsActive { get; set; } = true;
+    public string Status { get; set; } = "Active";
+    public DateTimeOffset? RotatedAt { get; set; }
 }

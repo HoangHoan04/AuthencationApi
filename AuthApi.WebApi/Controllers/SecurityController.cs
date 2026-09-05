@@ -41,21 +41,16 @@ public class SecurityController : ControllerBase
     }
 
     [HttpGet("api/admin/security/keys")]
-    public ActionResult<List<SecurityKeyDto>> GetSecurityKeys()
+    public async Task<ActionResult<List<SecurityKeyDto>>> GetSecurityKeys()
     {
-        var jwks = _rsaKeyManager.GetJwks();
-        var key = jwks.Keys.FirstOrDefault();
-        var keyDto = new SecurityKeyDto
-        {
-            KeyId = key?.Kid ?? _rsaKeyManager.GetKeyId(),
-            Algorithm = key?.Alg ?? "RS256",
-            Use = key?.Use ?? "sig",
-            Modulus = key?.N ?? string.Empty,
-            Exponent = key?.E ?? string.Empty,
-            CreatedAt = DateTimeOffset.UtcNow,
-            IsActive = true
-        };
+        return Ok(await _securityService.GetSigningKeysAsync());
+    }
 
-        return Ok(new List<SecurityKeyDto> { keyDto });
+    [HttpPost("api/admin/security/keys/rotate")]
+    [Authorize(Roles = "SuperAdmin")]
+    public async Task<IActionResult> RotateKeys()
+    {
+        await _rsaKeyManager.RotateAsync();
+        return Ok(new { success = true, keys = await _securityService.GetSigningKeysAsync() });
     }
 }

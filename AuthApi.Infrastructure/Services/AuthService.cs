@@ -1,16 +1,18 @@
 using System.Security.Cryptography;
 using System.Text;
 using AuthApi.Application.Common.Interfaces;
+using AuthApi.Application.Common.Models;
 using AuthApi.Application.DTOs.Auth;
 using AuthApi.Application.DTOs.Security;
 using AuthApi.Application.DTOs.Users;
-using AuthApi.Application.Mappings;
 using AuthApi.Domain.Entities.Auth;
-using AuthApi.Domain.Entities.Companies;
 using AuthApi.Domain.Entities.Users;
 using AuthApi.Domain.Enums;
+using AuthApi.Infrastructure.Security;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using OtpNet;
 
 namespace AuthApi.Infrastructure.Services;
 
@@ -19,27 +21,46 @@ public class AuthService : IAuthService
     private readonly IApplicationDbContext _context;
     private readonly IPasswordHasher _passwordHasher;
     private readonly IJwtTokenGenerator _jwtTokenGenerator;
+    private readonly IUserAccessService _access;
+    private readonly IPasswordPolicy _passwordPolicy;
+    private readonly IEmailSender _email;
+    private readonly IDataProtectionService _protection;
+    private readonly ITokenDenylist _denylist;
+    private readonly ISystemSettingService _systemSettingService;
+    private readonly IConfiguration _configuration;
     private readonly ILogger<AuthService> _logger;
 
     public AuthService(
         IApplicationDbContext context,
         IPasswordHasher passwordHasher,
         IJwtTokenGenerator jwtTokenGenerator,
+        IUserAccessService access,
+        IPasswordPolicy passwordPolicy,
+        IEmailSender email,
+        IDataProtectionService protection,
+        ITokenDenylist denylist,
+        ISystemSettingService systemSettingService,
+        IConfiguration configuration,
         ILogger<AuthService> logger)
     {
         _context = context;
         _passwordHasher = passwordHasher;
         _jwtTokenGenerator = jwtTokenGenerator;
+        _access = access;
+        _passwordPolicy = passwordPolicy;
+        _email = email;
+        _protection = protection;
+        _denylist = denylist;
+        _systemSettingService = systemSettingService;
+        _configuration = configuration;
         _logger = logger;
     }
 
     public async Task<AuthResponse> LoginAsync(LoginRequest request, string? ipAddress, string? userAgent)
     {
-        var email = request.EffectiveEmail;
-        var normalizedEmail = email.Trim().ToLowerInvariant();
-        var user = await _context.Users
-            .Include(u => u.Company)
-            .FirstOrDefaultAsync(u => u.Email.ToLower() == normalizedEmail);
+        var email = request.EffectiveEmail.Trim().ToLowerInvariant();
+        var user = await _context.Users.Include(u => u.Company)
+            .FirstOrDefaultAsync(u => u.Email.ToLower() == email);
 
         if (user == null)
         {
@@ -47,176 +68,143 @@ public class AuthService : IAuthService
             throw new UnauthorizedAccessException("Email hoặc mật khẩu không chính xác.");
         }
 
-        if (user.Status == UserStatus.Disabled)
+        if (user.Status is UserStatus.Disabled or UserStatus.Invited)
         {
-            await LogLoginEventAsync(user.Id, request.Email, LoginEventType.LoginFailed, ipAddress, userAgent, "Account disabled");
-            throw new UnauthorizedAccessException("Tài khoản đã bị vô hiệu hóa.");
+            await LogLoginEventAsync(user.Id, email, LoginEventType.LoginFailed, ipAddress, userAgent, "Account not active");
+            throw new UnauthorizedAccessException("Tài khoản chưa kích hoạt hoặc đã bị vô hiệu hóa.");
         }
 
         if (user.LockedUntil.HasValue && user.LockedUntil.Value > DateTimeOffset.UtcNow)
         {
             var remainingMin = Math.Ceiling((user.LockedUntil.Value - DateTimeOffset.UtcNow).TotalMinutes);
-            await LogLoginEventAsync(user.Id, request.Email, LoginEventType.LoginFailed, ipAddress, userAgent, "Account temporarily locked");
-            throw new UnauthorizedAccessException($"Tài khoản bị tạm khóa do nhập sai nhiều lần. Vui lòng thử lại sau {remainingMin} phút.");
+            throw new UnauthorizedAccessException($"Tài khoản bị tạm khóa. Thử lại sau {remainingMin} phút.");
         }
 
-        var isPasswordValid = _passwordHasher.VerifyPassword(request.Password, user.PasswordHash);
-        if (!isPasswordValid)
+        if (!_passwordHasher.VerifyPassword(request.Password, user.PasswordHash))
         {
             user.FailedLoginAttempts++;
             if (user.FailedLoginAttempts >= 5)
             {
                 user.LockedUntil = DateTimeOffset.UtcNow.AddMinutes(15);
-                await LogLoginEventAsync(user.Id, request.Email, LoginEventType.AccountLocked, ipAddress, userAgent, "Locked after 5 failed attempts");
+                await LogLoginEventAsync(user.Id, email, LoginEventType.AccountLocked, ipAddress, userAgent, "Locked after 5 failed attempts");
             }
             else
             {
-                await LogLoginEventAsync(user.Id, request.Email, LoginEventType.LoginFailed, ipAddress, userAgent, $"Invalid password (Attempt {user.FailedLoginAttempts})");
+                await LogLoginEventAsync(user.Id, email, LoginEventType.LoginFailed, ipAddress, userAgent, "Invalid password");
             }
 
             await _context.SaveChangesAsync();
             throw new UnauthorizedAccessException("Email hoặc mật khẩu không chính xác.");
         }
 
-        // Reset failed login attempts on success
         user.FailedLoginAttempts = 0;
         user.LockedUntil = null;
 
-        var accessToken = _jwtTokenGenerator.GenerateAccessToken(user);
-        var (rawRefreshToken, tokenHash) = _jwtTokenGenerator.GenerateRefreshToken();
+        var isTwoFactorGloballyEnabled = await _systemSettingService.IsTwoFactorAuthEnabledAsync();
 
-        var familyId = Guid.NewGuid();
-        var refreshTokenEntity = new RefreshToken
+        if (isTwoFactorGloballyEnabled && user.MfaEnabled)
         {
-            Id = Guid.NewGuid(),
-            UserId = user.Id,
-            TokenHash = tokenHash,
-            FamilyId = familyId,
-            DeviceName = !string.IsNullOrWhiteSpace(request.DeviceName) ? request.DeviceName : "Web Browser",
-            IpAddress = ipAddress,
-            UserAgent = userAgent,
-            ExpiresAt = DateTimeOffset.UtcNow.AddDays(7),
-            CreatedAt = DateTimeOffset.UtcNow
-        };
+            await _context.SaveChangesAsync();
+            return new AuthResponse
+            {
+                RequiresTwoFactor = true,
+                TempToken = _jwtTokenGenerator.GenerateMfaTempToken(user.Id),
+                User = UserProfileFactory.From(user)
+            };
+        }
 
-        _context.RefreshTokens.Add(refreshTokenEntity);
-        await LogLoginEventAsync(user.Id, request.Email, LoginEventType.LoginSuccess, ipAddress, userAgent, null);
-        await _context.SaveChangesAsync();
+        return await IssueSessionAsync(user, ipAddress, userAgent, request.DeviceName);
+    }
 
-        return new AuthResponse
+    public async Task<AuthResponse> VerifyTwoFactorAsync(VerifyTwoFactorRequest request, string? ipAddress, string? userAgent)
+    {
+        var userId = _jwtTokenGenerator.ReadMfaTempUserId(request.TempToken)
+            ?? throw new UnauthorizedAccessException("Phiên MFA không hợp lệ hoặc đã hết hạn.");
+
+        var user = await _context.Users.Include(u => u.Company).FirstOrDefaultAsync(u => u.Id == userId)
+            ?? throw new UnauthorizedAccessException("Không tìm thấy người dùng.");
+
+        if (!await VerifyMfaOrBackupAsync(user.Id, request.Code))
         {
-            AccessToken = accessToken,
-            RefreshToken = rawRefreshToken,
-            ExpiresIn = 900,
-            TokenType = "Bearer",
-            User = UserMapper.ToDto(user)
-        };
+            throw new UnauthorizedAccessException("Mã xác thực không hợp lệ.");
+        }
+
+        return await IssueSessionAsync(user, ipAddress, userAgent, null);
     }
 
     public async Task<AuthResponse> RefreshTokenAsync(RefreshTokenRequest request, string? ipAddress, string? userAgent)
     {
-        var tokenHash = HashRefreshToken(request.RefreshToken);
-        var storedToken = await _context.RefreshTokens
-            .Include(t => t.User)
-            .ThenInclude(u => u!.Company)
-            .FirstOrDefaultAsync(t => t.TokenHash == tokenHash);
-
-        if (storedToken == null || storedToken.User == null)
+        var raw = request.EffectiveRefreshToken;
+        if (string.IsNullOrWhiteSpace(raw))
         {
             throw new UnauthorizedAccessException("Refresh token không hợp lệ.");
         }
 
-        // Detect Token Reuse / Replay Attack!
+        var tokenHash = HashToken(raw);
+        var storedToken = await _context.RefreshTokens
+            .FirstOrDefaultAsync(t => t.TokenHash == tokenHash);
+
+        if (storedToken == null)
+        {
+            throw new UnauthorizedAccessException("Refresh token không hợp lệ.");
+        }
+
+        var user = await _context.Users
+            .Include(u => u.Company)
+            .FirstOrDefaultAsync(u => u.Id == storedToken.UserId);
+        if (user == null)
+        {
+            throw new UnauthorizedAccessException("Refresh token không hợp lệ.");
+        }
+
         if (storedToken.RevokedAt != null)
         {
-            _logger.LogWarning("Refresh token reuse detected for User {UserId}, Family {FamilyId}. Revoking family tokens!",
-                storedToken.UserId, storedToken.FamilyId);
-
-            // Invalidate all tokens in the family
             var familyTokens = await _context.RefreshTokens
                 .Where(t => t.FamilyId == storedToken.FamilyId && t.RevokedAt == null)
                 .ToListAsync();
-
             foreach (var t in familyTokens)
             {
                 t.RevokedAt = DateTimeOffset.UtcNow;
             }
 
-            await LogLoginEventAsync(storedToken.UserId, storedToken.User.Email, LoginEventType.Logout, ipAddress, userAgent, "Token replay attack detected");
             await _context.SaveChangesAsync();
-
             throw new UnauthorizedAccessException("Phát hiện phiên đăng nhập không hợp lệ. Vui lòng đăng nhập lại.");
         }
 
         if (DateTimeOffset.UtcNow >= storedToken.ExpiresAt)
         {
-            throw new UnauthorizedAccessException("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.");
+            throw new UnauthorizedAccessException("Phiên đăng nhập đã hết hạn.");
         }
 
-        // Revoke the old token
         storedToken.RevokedAt = DateTimeOffset.UtcNow;
-
-        // Generate new token pair with the same FamilyId (Token Rotation)
-        var user = storedToken.User!;
-        var newAccessToken = _jwtTokenGenerator.GenerateAccessToken(user);
-        var (newRawRefreshToken, newTokenHash) = _jwtTokenGenerator.GenerateRefreshToken();
-
-        var newRefreshTokenEntity = new RefreshToken
-        {
-            Id = Guid.NewGuid(),
-            UserId = user.Id,
-            TokenHash = newTokenHash,
-            FamilyId = storedToken.FamilyId,
-            DeviceName = !string.IsNullOrWhiteSpace(request.DeviceName) ? request.DeviceName : storedToken.DeviceName,
-            IpAddress = ipAddress ?? storedToken.IpAddress,
-            UserAgent = userAgent ?? storedToken.UserAgent,
-            ExpiresAt = DateTimeOffset.UtcNow.AddDays(7),
-            CreatedAt = DateTimeOffset.UtcNow
-        };
-
-        storedToken.ReplacedByTokenId = newRefreshTokenEntity.Id;
-        _context.RefreshTokens.Add(newRefreshTokenEntity);
-
-        await LogLoginEventAsync(user.Id, user.Email, LoginEventType.TokenRefreshed, ipAddress, userAgent, null);
+        var response = await IssueSessionAsync(user, ipAddress, userAgent, request.DeviceName, storedToken.FamilyId, storedToken.AppId);
+        storedToken.ReplacedByTokenId = await _context.RefreshTokens
+            .Where(t => t.UserId == storedToken.UserId && t.FamilyId == storedToken.FamilyId)
+            .OrderByDescending(t => t.CreatedAt)
+            .Select(t => (Guid?)t.Id)
+            .FirstOrDefaultAsync();
         await _context.SaveChangesAsync();
-
-        return new AuthResponse
-        {
-            AccessToken = newAccessToken,
-            RefreshToken = newRawRefreshToken,
-            ExpiresIn = 900,
-            TokenType = "Bearer",
-            User = UserMapper.ToDto(user)
-        };
+        return response;
     }
 
     public async Task<bool> LogoutAsync(string refreshToken)
     {
-        var tokenHash = HashRefreshToken(refreshToken);
-        var token = await _context.RefreshTokens
-            .Include(t => t.User)
+        var tokenHash = HashToken(refreshToken);
+        var token = await _context.RefreshTokens.Include(t => t.User)
             .FirstOrDefaultAsync(t => t.TokenHash == tokenHash);
-
-        if (token != null && token.RevokedAt == null)
+        if (token == null || token.RevokedAt != null)
         {
-            token.RevokedAt = DateTimeOffset.UtcNow;
-            if (token.User != null)
-            {
-                await LogLoginEventAsync(token.UserId, token.User.Email, LoginEventType.Logout, token.IpAddress, token.UserAgent, "User logged out");
-            }
-            await _context.SaveChangesAsync();
-            return true;
+            return false;
         }
 
-        return false;
+        token.RevokedAt = DateTimeOffset.UtcNow;
+        await _context.SaveChangesAsync();
+        return true;
     }
 
     public async Task<List<SessionDto>> GetActiveSessionsAsync(Guid userId, string? currentRefreshToken)
     {
-        string? currentHash = !string.IsNullOrWhiteSpace(currentRefreshToken)
-            ? HashRefreshToken(currentRefreshToken)
-            : null;
-
+        string? currentHash = string.IsNullOrWhiteSpace(currentRefreshToken) ? null : HashToken(currentRefreshToken);
         var tokens = await _context.RefreshTokens
             .Where(t => t.UserId == userId && t.RevokedAt == null && t.ExpiresAt > DateTimeOffset.UtcNow)
             .OrderByDescending(t => t.CreatedAt)
@@ -237,145 +225,327 @@ public class AuthService : IAuthService
 
     public async Task<bool> RevokeSessionAsync(Guid userId, Guid sessionId)
     {
-        var token = await _context.RefreshTokens
-            .FirstOrDefaultAsync(t => t.Id == sessionId && t.UserId == userId);
-
-        if (token != null && token.RevokedAt == null)
+        var token = await _context.RefreshTokens.FirstOrDefaultAsync(t => t.Id == sessionId && t.UserId == userId);
+        if (token == null || token.RevokedAt != null)
         {
-            token.RevokedAt = DateTimeOffset.UtcNow;
-            await _context.SaveChangesAsync();
-            return true;
+            return false;
         }
 
-        return false;
+        token.RevokedAt = DateTimeOffset.UtcNow;
+        await _context.SaveChangesAsync();
+        return true;
     }
 
     public async Task<bool> RevokeAllOtherSessionsAsync(Guid userId, string currentRefreshToken)
     {
-        var currentHash = HashRefreshToken(currentRefreshToken);
+        var currentHash = HashToken(currentRefreshToken);
         var otherTokens = await _context.RefreshTokens
             .Where(t => t.UserId == userId && t.TokenHash != currentHash && t.RevokedAt == null)
             .ToListAsync();
-
         foreach (var t in otherTokens)
         {
             t.RevokedAt = DateTimeOffset.UtcNow;
         }
 
+        await _denylist.RevokeUserAsync(userId, DateTimeOffset.UtcNow.AddMinutes(15), "revoke-others");
         await _context.SaveChangesAsync();
         return true;
     }
 
     public async Task<UserProfileDto> GetCurrentUserProfileAsync(Guid userId)
     {
-        var user = await _context.Users
-            .Include(u => u.Company)
-            .FirstOrDefaultAsync(u => u.Id == userId);
-
-        if (user == null)
-        {
-            throw new KeyNotFoundException("Không tìm thấy thông tin người dùng.");
-        }
-
-        return UserMapper.ToDto(user);
+        var user = await _context.Users.Include(u => u.Company).FirstOrDefaultAsync(u => u.Id == userId)
+            ?? throw new KeyNotFoundException("Không tìm thấy thông tin người dùng.");
+        var access = await _access.GetAsync(userId);
+        return UserProfileFactory.From(user, access);
     }
 
-    public async Task<bool> ChangePasswordAsync(Guid userId, ChangePasswordRequest request)
+    public async Task<AuthResponse> ChangePasswordAsync(Guid userId, ChangePasswordRequest request, string? ipAddress, string? userAgent)
     {
-        var user = await _context.Users.FirstOrDefaultAsync(u => u.Id == userId);
-        if (user == null)
-        {
-            throw new KeyNotFoundException("Không tìm thấy người dùng.");
-        }
+        var user = await _context.Users.Include(u => u.Company).FirstOrDefaultAsync(u => u.Id == userId)
+            ?? throw new KeyNotFoundException("Không tìm thấy người dùng.");
 
-        if (!_passwordHasher.VerifyPassword(request.CurrentPassword, user.PasswordHash))
+        if (!_passwordHasher.VerifyPassword(request.EffectiveCurrentPassword, user.PasswordHash))
         {
             throw new InvalidOperationException("Mật khẩu hiện tại không đúng.");
         }
 
-        user.PasswordHash = _passwordHasher.HashPassword(request.NewPassword);
-
-        // Revoke all active sessions on password change for security
-        var activeTokens = await _context.RefreshTokens
-            .Where(t => t.UserId == userId && t.RevokedAt == null)
-            .ToListAsync();
-
-        foreach (var t in activeTokens)
-        {
-            t.RevokedAt = DateTimeOffset.UtcNow;
-        }
-
-        await LogLoginEventAsync(user.Id, user.Email, LoginEventType.PasswordChanged, null, null, "Password changed by user");
+        await SetPasswordAsync(user, request.NewPassword);
+        await RevokeUserSessionsAsync(userId, "password-changed");
+        user.MustChangePassword = false;
+        await LogLoginEventAsync(user.Id, user.Email, LoginEventType.PasswordChanged, ipAddress, userAgent, "Password changed by user");
         await _context.SaveChangesAsync();
-        return true;
+        return await IssueSessionAsync(user, ipAddress, userAgent, "Web Browser");
     }
 
-    public async Task<string> ForgotPasswordAsync(ForgotPasswordRequest request)
+    public async Task ForgotPasswordAsync(ForgotPasswordRequest request)
     {
-        var normalizedEmail = request.Email.Trim().ToLowerInvariant();
-        var user = await _context.Users.FirstOrDefaultAsync(u => u.Email.ToLower() == normalizedEmail);
-
+        var email = request.Email.Trim().ToLowerInvariant();
+        var user = await _context.Users.FirstOrDefaultAsync(u => u.Email.ToLower() == email);
         if (user == null)
         {
-            // Do not disclose user existence
-            return string.Empty;
+            return;
         }
 
-        var rawToken = Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");
-        var tokenHash = HashRefreshToken(rawToken);
-
-        var resetEntity = new PasswordReset
+        var rawToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        _context.PasswordResets.Add(new PasswordReset
         {
             Id = Guid.NewGuid(),
             UserId = user.Id,
-            TokenHash = tokenHash,
-            ExpiresAt = DateTimeOffset.UtcNow.AddHours(2),
+            TokenHash = HashToken(rawToken),
+            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(30),
             IsUsed = false,
             CreatedAt = DateTimeOffset.UtcNow
-        };
-
-        _context.PasswordResets.Add(resetEntity);
-        await LogLoginEventAsync(user.Id, user.Email, LoginEventType.PasswordResetRequested, null, null, null);
+        });
         await _context.SaveChangesAsync();
 
-        return rawToken;
+        var publicBase = _configuration["Auth:PublicBaseUrl"] ?? "http://localhost:4300";
+        var link = $"{publicBase.TrimEnd('/')}/auth/reset-password?token={rawToken}";
+        await _email.SendAsync(user.Email, "Đặt lại mật khẩu",
+            $"<p>Yêu cầu đặt lại mật khẩu. Liên kết hết hạn sau 30 phút:</p><p><a href=\"{link}\">{link}</a></p>");
     }
 
     public async Task<bool> ResetPasswordAsync(ResetPasswordRequest request)
     {
-        var tokenHash = HashRefreshToken(request.Token);
-        var reset = await _context.PasswordResets
-            .Include(r => r.User)
-            .FirstOrDefaultAsync(r => r.TokenHash == tokenHash && !r.IsUsed);
+        var token = request.Token?.Trim() ?? string.Empty;
+        var reset = await _context.PasswordResets.Include(r => r.User)
+            .FirstOrDefaultAsync(r => r.TokenHash == HashToken(token) && !r.IsUsed);
 
-        if (reset == null || reset.User == null || reset.ExpiresAt <= DateTimeOffset.UtcNow)
+        if (reset?.User == null || reset.ExpiresAt <= DateTimeOffset.UtcNow)
         {
             throw new InvalidOperationException("Mã đặt lại mật khẩu không hợp lệ hoặc đã hết hạn.");
         }
 
+        await SetPasswordAsync(reset.User, request.NewPassword);
         reset.IsUsed = true;
-        reset.User.PasswordHash = _passwordHasher.HashPassword(request.NewPassword);
+        reset.ConsumedAt = DateTimeOffset.UtcNow;
+        await RevokeUserSessionsAsync(reset.UserId, "password-reset");
+        await _context.SaveChangesAsync();
+        return true;
+    }
 
-        // Revoke all existing sessions
-        var tokens = await _context.RefreshTokens
-            .Where(t => t.UserId == reset.UserId && t.RevokedAt == null)
+    public async Task<TwoFactorSetupResponse> SetupTwoFactorAsync(Guid userId)
+    {
+        var user = await _context.Users.FirstAsync(u => u.Id == userId);
+        var secret = KeyGeneration.GenerateRandomKey(20);
+        var secretBase32 = Base32Encoding.ToString(secret);
+        var issuer = Uri.EscapeDataString(_configuration["Jwt:Issuer"] ?? "Auth");
+        var label = Uri.EscapeDataString(user.Email);
+
+        var existing = await _context.MfaDevices.Where(d => d.UserId == userId && !d.IsVerified).ToListAsync();
+        foreach (var device in existing)
+        {
+            device.IsDeleted = true;
+        }
+
+        _context.MfaDevices.Add(new MfaDevice
+        {
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            Method = MfaMethod.Totp,
+            Name = "Authenticator",
+            SecretEncrypted = _protection.Encrypt(secretBase32),
+            IsVerified = false,
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+        await _context.SaveChangesAsync();
+
+        return new TwoFactorSetupResponse
+        {
+            SecretKey = secretBase32,
+            ManualEntryKey = secretBase32,
+            QrCodeUri = $"otpauth://totp/{issuer}:{label}?secret={secretBase32}&issuer={issuer}&digits=6&period=30"
+        };
+    }
+
+    public async Task<IReadOnlyCollection<string>> EnableTwoFactorAsync(Guid userId, string code)
+    {
+        var device = await _context.MfaDevices
+            .Where(d => d.UserId == userId && !d.IsVerified)
+            .OrderByDescending(d => d.CreatedAt)
+            .FirstOrDefaultAsync() ?? throw new InvalidOperationException("Chưa khởi tạo MFA. Gọi setup trước.");
+
+        var secret = _protection.Decrypt(device.SecretEncrypted);
+        var totp = new Totp(Base32Encoding.ToBytes(secret));
+        if (!totp.VerifyTotp(code.Trim(), out _, new VerificationWindow(1, 1)))
+        {
+            throw new InvalidOperationException("Mã xác thực không đúng.");
+        }
+
+        device.IsVerified = true;
+        device.LastUsedAt = DateTimeOffset.UtcNow;
+        var user = await _context.Users.FirstAsync(u => u.Id == userId);
+        user.MfaEnabled = true;
+
+        var backupCodes = Enumerable.Range(0, 10)
+            .Select(_ => Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant())
+            .ToList();
+        var oldCodes = await _context.MfaBackupCodes.Where(c => c.UserId == userId).ToListAsync();
+        _context.MfaBackupCodes.RemoveRange(oldCodes);
+        foreach (var backup in backupCodes)
+        {
+            _context.MfaBackupCodes.Add(new MfaBackupCode
+            {
+                Id = Guid.NewGuid(),
+                UserId = userId,
+                CodeHash = _passwordHasher.HashPassword(backup),
+                CreatedAt = DateTimeOffset.UtcNow
+            });
+        }
+
+        await _context.SaveChangesAsync();
+        return backupCodes;
+    }
+
+    public async Task<bool> DisableTwoFactorAsync(Guid userId, DisableTwoFactorRequest request)
+    {
+        var user = await _context.Users.FirstAsync(u => u.Id == userId);
+        if (!string.IsNullOrWhiteSpace(request.Password) &&
+            !_passwordHasher.VerifyPassword(request.Password, user.PasswordHash))
+        {
+            throw new InvalidOperationException("Mật khẩu không đúng.");
+        }
+
+        if (!await VerifyMfaOrBackupAsync(userId, request.Code))
+        {
+            throw new InvalidOperationException("Mã xác thực không đúng.");
+        }
+
+        user.MfaEnabled = false;
+        var devices = await _context.MfaDevices.Where(d => d.UserId == userId).ToListAsync();
+        foreach (var device in devices)
+        {
+            device.IsDeleted = true;
+        }
+
+        await _context.SaveChangesAsync();
+        return true;
+    }
+
+    private async Task<bool> VerifyMfaOrBackupAsync(Guid userId, string code)
+    {
+        var trimmed = code.Trim();
+        var devices = await _context.MfaDevices.Where(d => d.UserId == userId && d.IsVerified).ToListAsync();
+        foreach (var device in devices)
+        {
+            var secret = _protection.Decrypt(device.SecretEncrypted);
+            var totp = new Totp(Base32Encoding.ToBytes(secret));
+            if (totp.VerifyTotp(trimmed, out _, new VerificationWindow(1, 1)))
+            {
+                device.LastUsedAt = DateTimeOffset.UtcNow;
+                await _context.SaveChangesAsync();
+                return true;
+            }
+        }
+
+        var backups = await _context.MfaBackupCodes.Where(c => c.UserId == userId && c.UsedAt == null).ToListAsync();
+        foreach (var backup in backups)
+        {
+            if (_passwordHasher.VerifyPassword(trimmed, backup.CodeHash))
+            {
+                backup.UsedAt = DateTimeOffset.UtcNow;
+                await _context.SaveChangesAsync();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private async Task<AuthResponse> IssueSessionAsync(
+        User user,
+        string? ipAddress,
+        string? userAgent,
+        string? deviceName,
+        Guid? familyId = null,
+        Guid? appId = null)
+    {
+        user.LastLoginAt = DateTimeOffset.UtcNow;
+        var access = await _access.GetAsync(user.Id);
+        var jti = Guid.NewGuid().ToString("N");
+        var accessToken = _jwtTokenGenerator.GenerateAccessToken(user, new AccessTokenClaims
+        {
+            Roles = access.Roles,
+            Permissions = access.Permissions,
+            Apps = access.Apps,
+            Jti = jti
+        });
+        var (rawRefresh, refreshHash) = _jwtTokenGenerator.GenerateRefreshToken();
+        _context.RefreshTokens.Add(new RefreshToken
+        {
+            Id = Guid.NewGuid(),
+            UserId = user.Id,
+            AppId = appId,
+            CompanyId = user.CompanyId,
+            TokenHash = refreshHash,
+            FamilyId = familyId ?? Guid.NewGuid(),
+            DeviceName = string.IsNullOrWhiteSpace(deviceName) ? "Web Browser" : deviceName,
+            IpAddress = ipAddress,
+            UserAgent = userAgent,
+            ExpiresAt = DateTimeOffset.UtcNow.AddDays(7),
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+        await LogLoginEventAsync(user.Id, user.Email, LoginEventType.LoginSuccess, ipAddress, userAgent, null);
+        await _context.SaveChangesAsync();
+
+        var profile = UserProfileFactory.From(user, access);
+        var isTwoFactorGloballyEnabled = await _systemSettingService.IsTwoFactorAuthEnabledAsync();
+        var mustEnrollMfa = isTwoFactorGloballyEnabled && !user.MfaEnabled &&
+                            access.Roles.Any(r => r is "SuperAdmin" or "Admin");
+
+        return new AuthResponse
+        {
+            AccessToken = accessToken,
+            RefreshToken = rawRefresh,
+            ExpiresIn = 900,
+            User = profile,
+            Roles = profile.Roles,
+            Permissions = profile.Permissions,
+            Apps = profile.Apps,
+            MustChangePassword = user.MustChangePassword,
+            MustEnrollMfa = mustEnrollMfa
+        };
+    }
+
+    private async Task SetPasswordAsync(User user, string newPassword)
+    {
+        _passwordPolicy.Validate(newPassword);
+        var history = await _context.PasswordHistories
+            .Where(h => h.UserId == user.Id)
+            .OrderByDescending(h => h.CreatedAt)
+            .Take(PasswordPolicy.HistoryCount)
             .ToListAsync();
+        if (history.Any(h => _passwordHasher.VerifyPassword(newPassword, h.PasswordHash)) ||
+            _passwordHasher.VerifyPassword(newPassword, user.PasswordHash))
+        {
+            throw new InvalidOperationException("Không được dùng lại mật khẩu gần đây.");
+        }
 
+        _context.PasswordHistories.Add(new PasswordHistory
+        {
+            Id = Guid.NewGuid(),
+            UserId = user.Id,
+            PasswordHash = user.PasswordHash,
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+        user.PasswordHash = _passwordHasher.HashPassword(newPassword);
+        user.PasswordChangedAt = DateTimeOffset.UtcNow;
+    }
+
+    private async Task RevokeUserSessionsAsync(Guid userId, string reason)
+    {
+        var tokens = await _context.RefreshTokens.Where(t => t.UserId == userId && t.RevokedAt == null).ToListAsync();
         foreach (var t in tokens)
         {
             t.RevokedAt = DateTimeOffset.UtcNow;
         }
 
-        await LogLoginEventAsync(reset.UserId, reset.User.Email, LoginEventType.PasswordChanged, null, null, "Password reset via token");
-        await _context.SaveChangesAsync();
-        return true;
+        await _denylist.RevokeUserAsync(userId, DateTimeOffset.UtcNow.AddMinutes(15), reason);
     }
 
-    private static string HashRefreshToken(string token)
+    private static string HashToken(string token)
     {
-        using var sha256 = SHA256.Create();
-        var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
-        return Convert.ToHexString(hashBytes);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token.Trim())));
     }
 
     private async Task LogLoginEventAsync(
@@ -386,25 +556,17 @@ public class AuthService : IAuthService
         string? userAgent,
         string? failureReason)
     {
-        try
+        _context.LoginHistories.Add(new LoginHistory
         {
-            var log = new LoginHistory
-            {
-                Id = Guid.NewGuid(),
-                UserId = userId,
-                EmailAttempted = email,
-                EventType = eventType,
-                IpAddress = ipAddress,
-                UserAgent = userAgent,
-                FailureReason = failureReason,
-                CreatedAt = DateTimeOffset.UtcNow
-            };
-
-            _context.LoginHistories.Add(log);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to record login history log.");
-        }
+            Id = Guid.NewGuid(),
+            UserId = userId,
+            EmailAttempted = email,
+            EventType = eventType,
+            IpAddress = ipAddress,
+            UserAgent = userAgent,
+            FailureReason = failureReason,
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+        await Task.CompletedTask;
     }
 }

@@ -1,6 +1,7 @@
 using AuthApi.Application.Features.Administrative;
 using AuthApi.Application.Features.Companies;
 using AuthApi.Application.Features.EcosystemApps;
+using AuthApi.Application.Features.Rbac;
 using AuthApi.Application.Features.Security;
 using AuthApi.Application.Features.Users;
 using Microsoft.Extensions.DependencyInjection;
@@ -16,6 +17,7 @@ public static class DependencyInjection
         services.AddScoped<IEcosystemAppService, EcosystemAppService>();
         services.AddScoped<IAdministrativeService, AdministrativeService>();
         services.AddScoped<ISecurityService, SecurityService>();
+        services.AddScoped<IRbacService, RbacService>();
 
         return services;
     }

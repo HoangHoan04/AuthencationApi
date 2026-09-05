@@ -1,7 +1,12 @@
 using System.Security.Cryptography;
 using AuthApi.Application.Common.Interfaces;
 using AuthApi.Application.Common.Models;
+using AuthApi.Domain.Entities.Security;
+using AuthApi.Domain.Enums;
+using AuthApi.Infrastructure.Persistence;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.IdentityModel.Tokens;
 
@@ -9,70 +14,166 @@ namespace AuthApi.Infrastructure.Security;
 
 public class RsaKeyManager : IRsaKeyManager
 {
-    private readonly RSA _rsa;
-    private readonly string _keyId;
-    private readonly JwksResponse _cachedJwks;
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IConfiguration _configuration;
+    private readonly ILogger<RsaKeyManager> _logger;
+    private readonly object _sync = new();
+    private RSA? _signingRsa;
+    private string _keyId = "auth-key-v1";
+    private JwksResponse _jwks = new();
+    private List<RsaSecurityKey> _validationKeys = new();
 
-    public RsaKeyManager(IConfiguration configuration, ILogger<RsaKeyManager> logger)
+    public RsaKeyManager(
+        IServiceScopeFactory scopeFactory,
+        IConfiguration configuration,
+        ILogger<RsaKeyManager> logger)
     {
-        _rsa = RSA.Create(2048);
-
-        // Check if existing PEM key is provided in config or key file
-        var privateKeyPem = configuration["Jwt:PrivateKeyPem"];
-        var keyPath = Path.Combine(AppContext.BaseDirectory, "rsa_private_key.pem");
-
-        if (!string.IsNullOrWhiteSpace(privateKeyPem))
-        {
-            _rsa.ImportFromPem(privateKeyPem);
-            logger.LogInformation("Loaded RSA Signing Key from Configuration.");
-        }
-        else if (File.Exists(keyPath))
-        {
-            var pem = File.ReadAllText(keyPath);
-            _rsa.ImportFromPem(pem);
-            logger.LogInformation("Loaded RSA Signing Key from file: {Path}", keyPath);
-        }
-        else
-        {
-            // Auto generate and persist key for consistency across app restarts
-            var pem = _rsa.ExportPkcs8PrivateKeyPem();
-            try
-            {
-                File.WriteAllText(keyPath, pem);
-                logger.LogInformation("Generated and saved new RSA 2048-bit Key to {Path}", keyPath);
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Could not persist RSA Key to disk, using in-memory key.");
-            }
-        }
-
-        var rsaParams = _rsa.ExportParameters(false);
-        var modulusBase64Url = Base64UrlEncoder.Encode(rsaParams.Modulus!);
-        var exponentBase64Url = Base64UrlEncoder.Encode(rsaParams.Exponent!);
-
-        _keyId = configuration["Jwt:KeyId"] ?? "auth-key-v1";
-
-        _cachedJwks = new JwksResponse
-        {
-            Keys = new List<JwkKeyDto>
-            {
-                new()
-                {
-                    Kty = "RSA",
-                    Use = "sig",
-                    Kid = _keyId,
-                    Alg = "RS256",
-                    N = modulusBase64Url,
-                    E = exponentBase64Url
-                }
-            }
-        };
+        _scopeFactory = scopeFactory;
+        _configuration = configuration;
+        _logger = logger;
     }
 
-    public RSA GetSigningKey() => _rsa;
+    public async Task InitializeAsync()
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        var protection = scope.ServiceProvider.GetRequiredService<IDataProtectionService>();
 
-    public string GetKeyId() => _keyId;
+        var keys = await db.SigningKeys
+            .Where(k => k.Status != SigningKeyStatus.Retired)
+            .OrderByDescending(k => k.Status == SigningKeyStatus.Active)
+            .ThenByDescending(k => k.CreatedAt)
+            .ToListAsync();
 
-    public JwksResponse GetJwks() => _cachedJwks;
+        if (keys.Count == 0)
+        {
+            var rsa = RSA.Create(2048);
+            var kid = _configuration["Jwt:KeyId"] ?? $"auth-key-{DateTime.UtcNow:yyyyMMdd}-v1";
+            var entity = new SigningKey
+            {
+                Id = Guid.NewGuid(),
+                KeyId = kid,
+                Algorithm = "RS256",
+                Use = "sig",
+                PrivateKeyPemEncrypted = protection.Encrypt(rsa.ExportPkcs8PrivateKeyPem()),
+                PublicKeyPem = rsa.ExportSubjectPublicKeyInfoPem(),
+                Status = SigningKeyStatus.Active,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+            db.SigningKeys.Add(entity);
+            await db.SaveChangesAsync();
+            keys.Add(entity);
+            _logger.LogInformation("Created signing key {KeyId}", kid);
+        }
+
+        ReloadFromEntities(keys, protection);
+    }
+
+    public RSA GetSigningKey()
+    {
+        EnsureInitialized();
+        return _signingRsa!;
+    }
+
+    public string GetKeyId()
+    {
+        EnsureInitialized();
+        return _keyId;
+    }
+
+    public JwksResponse GetJwks()
+    {
+        EnsureInitialized();
+        return _jwks;
+    }
+
+    public IEnumerable<SecurityKey> GetValidationKeys()
+    {
+        EnsureInitialized();
+        return _validationKeys;
+    }
+
+    public async Task RotateAsync()
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        var protection = scope.ServiceProvider.GetRequiredService<IDataProtectionService>();
+
+        var active = await db.SigningKeys.Where(k => k.Status == SigningKeyStatus.Active).ToListAsync();
+        foreach (var key in active)
+        {
+            key.Status = SigningKeyStatus.Rotating;
+            key.RotatedAt = DateTimeOffset.UtcNow;
+            key.RetireAfter = DateTimeOffset.UtcNow.AddHours(24);
+        }
+
+        var rsa = RSA.Create(2048);
+        var kid = $"auth-key-{DateTime.UtcNow:yyyyMMddHHmmss}";
+        db.SigningKeys.Add(new SigningKey
+        {
+            Id = Guid.NewGuid(),
+            KeyId = kid,
+            Algorithm = "RS256",
+            Use = "sig",
+            PrivateKeyPemEncrypted = protection.Encrypt(rsa.ExportPkcs8PrivateKeyPem()),
+            PublicKeyPem = rsa.ExportSubjectPublicKeyInfoPem(),
+            Status = SigningKeyStatus.Active,
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+        await db.SaveChangesAsync();
+
+        var keys = await db.SigningKeys.Where(k => k.Status != SigningKeyStatus.Retired).ToListAsync();
+        ReloadFromEntities(keys, protection);
+        _logger.LogInformation("Rotated signing key. Active kid={KeyId}", kid);
+    }
+
+    private void EnsureInitialized()
+    {
+        if (_signingRsa != null)
+        {
+            return;
+        }
+
+        lock (_sync)
+        {
+            if (_signingRsa != null)
+            {
+                return;
+            }
+
+            InitializeAsync().GetAwaiter().GetResult();
+        }
+    }
+
+    private void ReloadFromEntities(List<SigningKey> keys, IDataProtectionService protection)
+    {
+        lock (_sync)
+        {
+            var active = keys.FirstOrDefault(k => k.Status == SigningKeyStatus.Active) ?? keys[0];
+            var rsa = RSA.Create();
+            rsa.ImportFromPem(protection.Decrypt(active.PrivateKeyPemEncrypted));
+            _signingRsa?.Dispose();
+            _signingRsa = rsa;
+            _keyId = active.KeyId;
+
+            _validationKeys = new List<RsaSecurityKey>();
+            var jwks = new List<JwkKeyDto>();
+            foreach (var key in keys)
+            {
+                var pub = RSA.Create();
+                pub.ImportFromPem(key.PublicKeyPem);
+                var parameters = pub.ExportParameters(false);
+                var securityKey = new RsaSecurityKey(pub) { KeyId = key.KeyId };
+                _validationKeys.Add(securityKey);
+                jwks.Add(new JwkKeyDto
+                {
+                    Kid = key.KeyId,
+                    N = Base64UrlEncoder.Encode(parameters.Modulus!),
+                    E = Base64UrlEncoder.Encode(parameters.Exponent!)
+                });
+            }
+
+            _jwks = new JwksResponse { Keys = jwks };
+        }
+    }
 }

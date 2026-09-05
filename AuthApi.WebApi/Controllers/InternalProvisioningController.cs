@@ -1,13 +1,11 @@
+using System.Security.Cryptography;
+using System.Text;
 using AuthApi.Application.DTOs.Users;
 using AuthApi.Application.Features.Users;
 using Microsoft.AspNetCore.Mvc;
 
 namespace AuthApi.WebApi.Controllers;
 
-/// <summary>
-/// Internal provisioning endpoint - called by other microservices (e.g. HrmApi) using an API key.
-/// Not exposed to end users. Protected by X-Internal-Api-Key header.
-/// </summary>
 [ApiController]
 [Route("api/internal")]
 public class InternalProvisioningController : ControllerBase
@@ -29,15 +27,17 @@ public class InternalProvisioningController : ControllerBase
     private bool IsAuthorized()
     {
         var expectedKey = _configuration["InternalApiKey"];
-        if (string.IsNullOrWhiteSpace(expectedKey)) return false;
+        if (string.IsNullOrWhiteSpace(expectedKey))
+        {
+            return false;
+        }
+
         Request.Headers.TryGetValue("X-Internal-Api-Key", out var provided);
-        return provided == expectedKey;
+        var expectedHash = SHA256.HashData(Encoding.UTF8.GetBytes(expectedKey));
+        var providedHash = SHA256.HashData(Encoding.UTF8.GetBytes(provided.ToString()));
+        return CryptographicOperations.FixedTimeEquals(expectedHash, providedHash);
     }
 
-    /// <summary>
-    /// Tạo tài khoản người dùng từ HRM (khi nhân viên mới được thêm vào).
-    /// Nếu email đã tồn tại thì trả về UserId hiện có.
-    /// </summary>
     [HttpPost("provision-employee")]
     public async Task<ActionResult<ProvisionEmployeeResponse>> ProvisionEmployee(
         [FromBody] ProvisionEmployeeRequest request)
@@ -55,13 +55,12 @@ public class InternalProvisioningController : ControllerBase
                 return Ok(new ProvisionEmployeeResponse { UserId = existing.Id, IsNew = false });
             }
 
-            var user = await _userService.CreateUserAsync(new CreateUserRequest
+            var user = await _userService.InviteAsync(new InviteUserRequest
             {
                 Email = request.Email,
                 FullName = request.FullName,
                 Phone = request.Phone,
                 CompanyId = request.CompanyId,
-                Password = request.DefaultPassword ?? GenerateTemporaryPassword(),
                 Role = "User",
             });
 
@@ -74,11 +73,16 @@ public class InternalProvisioningController : ControllerBase
         }
     }
 
-    private static string GenerateTemporaryPassword()
+    [HttpPost("deprovision-employee")]
+    public async Task<IActionResult> DeprovisionEmployee([FromBody] DeprovisionEmployeeRequest request)
     {
-        var chars = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#";
-        var random = new Random();
-        return new string(Enumerable.Range(0, 12).Select(_ => chars[random.Next(chars.Length)]).ToArray());
+        if (!IsAuthorized())
+        {
+            return Unauthorized(new { message = "Invalid or missing X-Internal-Api-Key." });
+        }
+
+        var success = await _userService.DeprovisionAsync(request.Email);
+        return Ok(new { success });
     }
 }
 
@@ -89,6 +93,11 @@ public class ProvisionEmployeeRequest
     public string? Phone { get; set; }
     public Guid? CompanyId { get; set; }
     public string? DefaultPassword { get; set; }
+}
+
+public class DeprovisionEmployeeRequest
+{
+    public string Email { get; set; } = string.Empty;
 }
 
 public class ProvisionEmployeeResponse

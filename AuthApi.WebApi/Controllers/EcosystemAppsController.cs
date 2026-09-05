@@ -58,4 +58,11 @@ public class EcosystemAppsController : ControllerBase
         var success = await _appService.DeleteAppAsync(id);
         return Ok(new { success });
     }
+
+    [HttpPost("{id:guid}/rotate-secret")]
+    public async Task<ActionResult<EcosystemAppDto>> RotateSecret(Guid id)
+    {
+        var app = await _appService.RotateSecretAsync(id);
+        return Ok(app);
+    }
 }

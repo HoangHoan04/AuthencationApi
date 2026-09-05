@@ -33,10 +33,23 @@ public class PasswordHasher : IPasswordHasher
 
     public bool VerifyPassword(string password, string passwordHash)
     {
+        if (string.IsNullOrEmpty(passwordHash))
+        {
+            return false;
+        }
+
         var segments = passwordHash.Split(SegmentDelimiter);
         if (segments.Length != 4)
         {
-            return false;
+            // Client secret / OTP copied as plaintext during the hash-column migration.
+            var provided = System.Text.Encoding.UTF8.GetBytes(password);
+            var stored = System.Text.Encoding.UTF8.GetBytes(passwordHash);
+            if (provided.Length != stored.Length)
+            {
+                return false;
+            }
+
+            return CryptographicOperations.FixedTimeEquals(provided, stored);
         }
 
         byte[] hash = Convert.FromHexString(segments[0]);

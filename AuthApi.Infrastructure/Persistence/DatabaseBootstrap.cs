@@ -1,6 +1,4 @@
 using AuthApi.Application.Common.Interfaces;
-using AuthApi.Domain.Entities.Users;
-using AuthApi.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -23,53 +21,50 @@ public static class DatabaseBootstrap
         var connectionString = configuration.GetConnectionString("DefaultConnection")
             ?? throw new InvalidOperationException("Connection string 'DefaultConnection' not found.");
 
-        try
-        {
-            await EnsureUtf8DatabaseAsync(connectionString, logger);
+        await EnsureUtf8DatabaseAsync(connectionString, configuration, logger);
 
-            var context = services.GetRequiredService<ApplicationDbContext>();
-            await context.Database.MigrateAsync();
+        var context = services.GetRequiredService<ApplicationDbContext>();
+        await context.Database.MigrateAsync();
 
-            var passwordHasher = services.GetRequiredService<IPasswordHasher>();
-            await SeedDefaultAdminUserAsync(context, passwordHasher, logger);
+        var passwordHasher = services.GetRequiredService<IPasswordHasher>();
+        await IdentitySeeder.SeedAsync(context, passwordHasher, configuration, logger);
 
-            logger.LogInformation("Auth Database initialized successfully.");
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "An error occurred while migrating or initializing the Auth database.");
-            throw;
-        }
+        logger.LogInformation("Auth database initialized.");
     }
 
-    private static async Task EnsureUtf8DatabaseAsync(string connectionString, ILogger logger)
+    private static async Task EnsureUtf8DatabaseAsync(string connectionString, IConfiguration configuration, ILogger logger)
     {
         var builder = new NpgsqlConnectionStringBuilder(connectionString);
         var targetDatabase = builder.Database;
-
         if (string.IsNullOrWhiteSpace(targetDatabase))
         {
             return;
         }
 
         builder.Database = "postgres";
-        var masterConnStr = builder.ConnectionString;
-
-        await using var conn = new NpgsqlConnection(masterConnStr);
+        await using var conn = new NpgsqlConnection(builder.ConnectionString);
         await conn.OpenAsync();
 
         var encodingId = await GetDatabaseEncodingIdAsync(conn, targetDatabase);
         if (encodingId == null)
         {
-            logger.LogInformation("Database '{TargetDatabase}' does not exist. Creating with UTF8...", targetDatabase);
+            logger.LogInformation("Creating UTF8 database {Database}", targetDatabase);
             await CreateUtf8DatabaseAsync(conn, targetDatabase);
+            return;
         }
-        else if (encodingId != Utf8EncodingId)
+
+        if (encodingId != Utf8EncodingId)
         {
-            logger.LogWarning("Database '{TargetDatabase}' has non-UTF8 encoding (id={EncodingId}). Recreating with UTF8...", targetDatabase, encodingId);
+            var allowDrop = configuration.GetValue<bool>("Database:AllowDropNonUtf8");
+            if (!allowDrop)
+            {
+                throw new InvalidOperationException(
+                    $"Database '{targetDatabase}' is not UTF8. Set Database:AllowDropNonUtf8=true only in local development to recreate it.");
+            }
+
+            logger.LogWarning("Recreating non-UTF8 database {Database} because Database:AllowDropNonUtf8=true.", targetDatabase);
             await using var dropCmd = new NpgsqlCommand($"DROP DATABASE IF EXISTS \"{targetDatabase}\" WITH (FORCE);", conn);
             await dropCmd.ExecuteNonQueryAsync();
-
             await CreateUtf8DatabaseAsync(conn, targetDatabase);
         }
     }
@@ -82,50 +77,16 @@ public static class DatabaseBootstrap
                  LC_COLLATE='C'
                  LC_CTYPE='C'
                  TEMPLATE template0;
-        """;
+            """;
         await using var createCmd = new NpgsqlCommand(createSql, conn);
         await createCmd.ExecuteNonQueryAsync();
     }
 
     private static async Task<int?> GetDatabaseEncodingIdAsync(NpgsqlConnection conn, string databaseName)
     {
-        var sql = "SELECT encoding FROM pg_database WHERE datname = @dbname;";
-        await using var cmd = new NpgsqlCommand(sql, conn);
+        await using var cmd = new NpgsqlCommand("SELECT encoding FROM pg_database WHERE datname = @dbname;", conn);
         cmd.Parameters.AddWithValue("dbname", databaseName);
         var res = await cmd.ExecuteScalarAsync();
         return res is null or DBNull ? null : Convert.ToInt32(res);
-    }
-
-    private static async Task SeedDefaultAdminUserAsync(
-        ApplicationDbContext context,
-        IPasswordHasher passwordHasher,
-        ILogger logger)
-    {
-        var adminEmail = "admin@company.com";
-        var adminUser = await context.Users.IgnoreQueryFilters().FirstOrDefaultAsync(u => u.Email == adminEmail);
-        if (adminUser == null)
-        {
-            adminUser = new User
-            {
-                Id = Guid.Parse("00000000-0000-0000-0000-000000000001"),
-                CompanyId = null,
-                Email = adminEmail,
-                Phone = "0901234567",
-                FullName = "Hệ thống Quản trị viên (Super Admin)",
-                Role = "SuperAdmin",
-                PasswordHash = passwordHasher.HashPassword("Admin@123456"),
-                Status = UserStatus.Active,
-                FailedLoginAttempts = 0,
-                CreatedAt = DateTimeOffset.UtcNow
-            };
-            context.Users.Add(adminUser);
-            await context.SaveChangesAsync();
-            logger.LogInformation("Seeded default superadmin user: {Email} / Admin@123456", adminEmail);
-        }
-        else if (adminUser.Role != "SuperAdmin")
-        {
-            adminUser.Role = "SuperAdmin";
-            await context.SaveChangesAsync();
-        }
     }
 }

@@ -10,6 +10,11 @@ public class EcosystemAppDto
     public string Namespace { get; set; } = string.Empty;
     public string ClientId { get; set; } = string.Empty;
     public string ClientSecret { get; set; } = string.Empty;
+    public string? PlaintextSecret { get; set; }
+    public bool RequirePkce { get; set; }
+    public string AppType { get; set; } = "Spa";
+    public int AccessTokenTtlMinutes { get; set; }
+    public int RefreshTokenTtlDays { get; set; }
     public List<string> RedirectUrls { get; set; } = new();
     public string Url { get; set; } = string.Empty;
     public string Icon { get; set; } = "appstore";
@@ -34,6 +39,7 @@ public class CreateAppRequest
     public string? Icon { get; set; }
     public string? Color { get; set; }
     public string? Category { get; set; }
+    public bool? RequirePkce { get; set; }
     public bool IsActive { get; set; } = true;
     public int SortOrder { get; set; } = 0;
 }
@@ -51,6 +57,7 @@ public class UpdateAppRequest
     public string? Icon { get; set; }
     public string? Color { get; set; }
     public string? Category { get; set; }
+    public bool? RequirePkce { get; set; }
     public bool IsActive { get; set; } = true;
     public int SortOrder { get; set; } = 0;
 }

@@ -31,6 +31,13 @@ public class UsersController : ControllerBase
         return Ok(user);
     }
 
+    [HttpPost("invite")]
+    public async Task<ActionResult<UserProfileDto>> Invite([FromBody] InviteUserRequest request)
+    {
+        var user = await _userService.InviteAsync(request);
+        return Ok(user);
+    }
+
     [HttpPut("{id:guid}")]
     public async Task<ActionResult<UserProfileDto>> UpdateUser(Guid id, [FromBody] UpdateUserRequest request)
     {
@@ -57,5 +64,32 @@ public class UsersController : ControllerBase
     {
         var success = await _userService.UnlockUserAsync(id);
         return Ok(new { success });
+    }
+
+    [HttpGet("{id:guid}/apps")]
+    public async Task<IActionResult> GetApps(Guid id)
+    {
+        return Ok(await _userService.GetAssignedAppIdsAsync(id));
+    }
+
+    [HttpPost("{id:guid}/apps")]
+    public async Task<IActionResult> AssignApps(Guid id, [FromBody] AssignUserAppsRequest request)
+    {
+        await _userService.AssignAppsAsync(id, request.AppIds);
+        return Ok(new { success = true });
+    }
+
+    [HttpPost("{id:guid}/roles")]
+    public async Task<IActionResult> AssignRole(Guid id, [FromBody] AssignUserRolesRequest request)
+    {
+        await _userService.AssignRoleAsync(id, request);
+        return Ok(new { success = true });
+    }
+
+    [HttpPost("{id:guid}/force-logout")]
+    public async Task<IActionResult> ForceLogout(Guid id)
+    {
+        await _userService.ForceLogoutAsync(id);
+        return Ok(new { success = true });
     }
 }

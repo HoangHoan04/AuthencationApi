@@ -1,3 +1,4 @@
+using AuthApi.Domain.Entities.EcosystemApps;
 using AuthApi.Domain.Entities.Users;
 
 namespace AuthApi.Domain.Entities.Auth;
@@ -6,6 +7,8 @@ public class RefreshToken
 {
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid UserId { get; set; }
+    public Guid? AppId { get; set; }
+    public Guid? CompanyId { get; set; }
     public string TokenHash { get; set; } = string.Empty;
     public Guid FamilyId { get; set; }
     public string? DeviceName { get; set; }
@@ -17,4 +20,5 @@ public class RefreshToken
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
     public virtual User? User { get; set; }
+    public virtual EcosystemApp? App { get; set; }
 }

@@ -1,7 +1,9 @@
+using AuthApi.Application.Common;
 using AuthApi.Application.Common.Interfaces;
 using AuthApi.Application.DTOs.Companies;
 using AuthApi.Application.Mappings;
 using AuthApi.Domain.Entities.Companies;
+using AuthApi.Domain.Entities.Rbac;
 using AuthApi.Domain.Entities.Users;
 using AuthApi.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
@@ -76,11 +78,23 @@ public class CompanyService : ICompanyService
                     FullName = string.IsNullOrWhiteSpace(request.AdminFullName) ? $"{company.Name} Admin" : request.AdminFullName.Trim(),
                     Phone = request.Phone?.Trim(),
                     PasswordHash = _passwordHasher.HashPassword(request.Password),
-                    Role = "Admin",
                     Status = UserStatus.Active,
+                    MustChangePassword = true,
                     CreatedAt = DateTimeOffset.UtcNow
                 };
                 _context.Users.Add(adminUser);
+                var adminRole = await _context.Roles.FirstOrDefaultAsync(r => r.Code == RoleCodes.Admin);
+                if (adminRole != null)
+                {
+                    _context.UserRoles.Add(new UserRole
+                    {
+                        Id = Guid.NewGuid(),
+                        UserId = adminUser.Id,
+                        RoleId = adminRole.Id,
+                        CompanyId = company.Id,
+                        CreatedAt = DateTimeOffset.UtcNow
+                    });
+                }
             }
         }
 
